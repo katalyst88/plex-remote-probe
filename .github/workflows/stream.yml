@@ -1,0 +1,55 @@
+name: plex-remote-stream
+
+on:
+  workflow_dispatch:
+    inputs:
+      rating_key:
+        description: "Plex ratingKey to stream"
+        required: true
+        default: "450427"
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stream a real movie from Plex over the public internet
+        env:
+          PLEX_URL: ${{ secrets.PLEX_URL }}
+          PLEX_TOKEN: ${{ secrets.PLEX_TOKEN }}
+          RK: ${{ inputs.rating_key }}
+        run: |
+          set -uo pipefail
+          CID="remote-probe-$RANDOM"
+          H1="X-Plex-Token: $PLEX_TOKEN"
+          H2="X-Plex-Client-Identifier: $CID"
+          H3="X-Plex-Product: Plex for Apple TV"
+          H4="X-Plex-Platform: tvOS"
+          H5="X-Plex-Device: Apple TV"
+          H6="X-Plex-Session-Identifier: $CID"
+
+          echo "runner (remote client) IP: $(curl -s --max-time 10 https://api.ipify.org)"
+          echo
+
+          # Ask Plex to make a streaming decision, exactly like a TV app does.
+          DEC="$PLEX_URL/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=http&directPlay=1&directStream=1&fastSeek=1&location=wan&session=$CID&X-Plex-Client-Profile-Name=tvOS"
+          curl -s -o /tmp/dec.xml -H "$H1" -H "$H2" -H "$H3" -H "$H4" -H "$H5" -H "$H6" --max-time 45 "$DEC"
+          echo "=== Plex's streaming decision for a WAN client ==="
+          grep -oE 'decisionCode="[^"]*"|generalDecisionText="[^"]*"|directPlayDecisionText="[^"]*"|transcodeDecisionText="[^"]*"' /tmp/dec.xml | head -4 | sed 's/^/  /'
+          echo
+
+          echo "=== STREAMING for 30 seconds (real transcode session over WAN) ==="
+          SURL="$PLEX_URL/video/:/transcode/universal/start?path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=http&directPlay=0&directStream=1&fastSeek=1&location=wan&maxVideoBitrate=12000&videoQuality=100&videoResolution=1920x1080&session=$CID&copyts=1"
+          read code tot spd size <<<"$(curl -s -o /tmp/stream.ts \
+            -w '%{http_code} %{time_total} %{speed_download} %{size_download}' \
+            --max-time 30 -H "$H1" -H "$H2" -H "$H3" -H "$H4" -H "$H5" -H "$H6" "$SURL")"
+          awk -v c="$code" -v t="$tot" -v s="$spd" -v z="$size" 'BEGIN{
+            printf "  HTTP %s   pulled %.1f MB in %.1fs   =  %.2f Mbps sustained\n", c, z/1048576, t, s*8/1000000
+          }'
+          echo "  first bytes of payload: $(head -c 4 /tmp/stream.ts | xxd -p 2>/dev/null || echo n/a)  (47... = valid MPEG-TS video)"
+          if [ "$size" -gt 2000000 ]; then
+            echo "  VERDICT: PASS - a remote client can stream video from this server"
+          else
+            echo "  VERDICT: FAIL - stream did not deliver video"
+          fi
+
+          curl -s -o /dev/null -H "$H1" -H "$H2" "$PLEX_URL/video/:/transcode/universal/stop?session=$CID" || true
