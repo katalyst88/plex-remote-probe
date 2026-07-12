@@ -1,0 +1,66 @@
+name: plex-remote-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      rating_key:
+        description: "Plex ratingKey of the movie to stream"
+        required: true
+        default: "450427"
+      part_key:
+        description: "Plex part key (path only)"
+        required: true
+        default: "/library/parts/625115/1776971725/file.mkv"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe Plex from the public internet
+        env:
+          PLEX_URL: ${{ secrets.PLEX_URL }}
+          PLEX_TOKEN: ${{ secrets.PLEX_TOKEN }}
+          RK: ${{ inputs.rating_key }}
+          PART: ${{ inputs.part_key }}
+        run: |
+          set -uo pipefail
+          H="X-Plex-Token: $PLEX_TOKEN"
+          HOSTN=$(echo "$PLEX_URL" | sed -E 's#https?://([^:/]+).*#\1#')
+
+          echo "::group::Where am I / can I resolve the server"
+          echo "runner public IP : $(curl -s --max-time 10 https://api.ipify.org || echo UNKNOWN)"
+          echo "server hostname  : ${HOSTN:0:14}...(redacted)"
+          getent hosts "$HOSTN" | awk '{print "DNS resolves to  : "$1}' || echo "DNS FAILED"
+          echo "::endgroup::"
+
+          probe () { # name, url
+            out=$(curl -s -o /tmp/body -w '%{http_code} %{time_total} %{size_download}' \
+                  --max-time 45 -H "$H" "$2" 2>/dev/null)
+            printf '%-34s HTTP %s   %ss   %s bytes\n' "$1" $out
+          }
+
+          echo "::group::The exact calls a TV app makes"
+          probe "identity (TLS handshake)"  "$PLEX_URL/identity"
+          probe "movie grid (library list)" "$PLEX_URL/library/sections/1/all?X-Plex-Container-Start=0&X-Plex-Container-Size=50"
+          probe "MOVIE DETAIL (the spinner)" "$PLEX_URL/library/metadata/$RK?includeExtras=1&includeRelated=1&includeChapters=1&includeOnDeck=1&includePopularLeaves=1"
+          echo "::endgroup::"
+
+          echo "::group::DIRECT PLAY throughput (what actually streams the file)"
+          # Pull 40 MB of the real media file, exactly like a direct-playing client.
+          read code time size <<<"$(curl -s -o /dev/null -w '%{http_code} %{time_total} %{size_download}' \
+              --max-time 120 -H "$H" -H "Range: bytes=0-41943039" "$PLEX_URL$PART")"
+          mbps=$(awk -v s="$size" -v t="$time" 'BEGIN{ if(t>0) printf "%.1f", (s*8)/(t*1000000); else print "0" }')
+          mb=$(awk -v s="$size" 'BEGIN{ printf "%.1f", s/1048576 }')
+          echo "HTTP $code   downloaded ${mb} MB in ${time}s   =  ${mbps} Mbps"
+          echo "(the file needs 8.1 Mbps to direct play in real time)"
+          verdict=$(awk -v m="$mbps" 'BEGIN{ print (m>=8.1) ? "PASS - fast enough to direct play" : "FAIL - too slow to direct play" }')
+          echo "VERDICT: $verdict"
+          echo "::endgroup::"
+
+          echo "::group::TRANSCODE start (what a bandwidth-limited client falls back to)"
+          SESS="probe$RANDOM"
+          TURL="$PLEX_URL/video/:/transcode/universal/start.m3u8?path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=hls&directPlay=0&directStream=1&fastSeek=1&location=wan&maxVideoBitrate=12000&videoQuality=100&videoResolution=1920x1080&session=$SESS&X-Plex-Client-Identifier=$SESS&X-Plex-Product=PlexProbe&X-Plex-Platform=Chrome"
+          read code time size <<<"$(curl -s -o /tmp/m3u8 -w '%{http_code} %{time_total} %{size_download}' --max-time 60 -H "$H" "$TURL")"
+          echo "start.m3u8   HTTP $code   ${time}s   ${size} bytes"
+          if [ "$code" = "200" ]; then head -5 /tmp/m3u8 | sed 's/^/    /'; else echo "    transcode session did NOT start"; fi
+          echo "::endgroup::"
