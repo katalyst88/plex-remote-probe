@@ -25,7 +25,9 @@ jobs:
           RK: ${{ inputs.rating_key || '450427' }}
         run: |
           set -uo pipefail
-          CID="devi-$RANDOM"
+          # Must be unique per run: $RANDOM alone repeats across runners, and Plex
+          # keys its streaming session off this.
+          CID="alveron-${GITHUB_RUN_ID}-${RANDOM}"
           A=(-H "X-Plex-Token: $PLEX_TOKEN" -H "X-Plex-Client-Identifier: $CID"
              -H "X-Plex-Product: Plex Web" -H "X-Plex-Platform: Chrome"
              -H "X-Plex-Session-Identifier: $CID")
@@ -60,9 +62,18 @@ jobs:
           # segments and check the MPEG-TS sync byte, not just the HTTP status.
           mbps=0; realtime=0; segs=0
           Q="path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=hls&directPlay=0&directStream=1&fastSeek=1&location=wan&maxVideoBitrate=12000&videoQuality=100&videoResolution=1920x1080&session=$CID&X-Plex-Client-Identifier=$CID"
-          # Plex briefly 400s a new transcode while a previous session is still tearing
-          # down, so a single attempt flaps between PASS and FAIL. Retry before believing
-          # it: a real outage fails all three, a teardown clears in seconds.
+
+          # A real client ALWAYS asks Plex for a streaming decision before it starts a
+          # stream. Skip this and Plex answers "Denying access due to session lacking
+          # decision" (HTTP 400). Doing it properly also means we now test the decision
+          # path itself — which is where "this file is unplayable for you" would surface.
+          dec=$(curl -s -o /tmp/dec.xml -w '%{http_code}' --max-time 45 "${A[@]}" "$B/decision?$Q")
+          verdict_text=$(grep -oE 'generalDecisionText="[^"]*"' /tmp/dec.xml | head -1 | cut -d'"' -f2)
+          echo "  streaming decision: HTTP $dec ${verdict_text:+- $verdict_text}"
+          if [ "$dec" != "200" ]; then
+            fails="$fails;Plex refused to prepare the stream (HTTP $dec)"
+          fi
+
           scode=000
           for i in 1 2 3; do
             scode=$(curl -s -o /tmp/master.m3u8 -w '%{http_code}' --max-time 60 "${A[@]}" "$B/start.m3u8?$Q")
