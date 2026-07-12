@@ -49,9 +49,21 @@ jobs:
           echo
 
           echo "=== DIRECT PLAY: pull 20 MB of the real movie file (needs 8.1 Mbps) ==="
+          # Identify as a real Plex client: Plex runs a streaming decision for WAN
+          # clients and 500s if the caller sends no client identity.
+          CID="probe-$RANDOM"
           read code tot spd size <<<"$(curl -s -o /dev/null \
             -w '%{http_code} %{time_total} %{speed_download} %{size_download}' \
-            --max-time 100 -H "$H" -H "Range: bytes=0-20971519" "$PLEX_URL$PART")"
+            --max-time 100 -H "$H" -H "Range: bytes=0-20971519" \
+            -H "X-Plex-Client-Identifier: $CID" \
+            -H "X-Plex-Product: Plex for Apple TV" \
+            -H "X-Plex-Version: 8.10" \
+            -H "X-Plex-Platform: tvOS" \
+            -H "X-Plex-Platform-Version: 17.0" \
+            -H "X-Plex-Device: Apple TV" \
+            -H "X-Plex-Model: 3" \
+            -H "X-Plex-Session-Identifier: $CID" \
+            "$PLEX_URL$PART")"
           awk -v c="$code" -v t="$tot" -v s="$spd" -v z="$size" 'BEGIN{
             printf "HTTP %s  got %.1f MB in %ss  =  %.2f Mbps\n", c, z/1048576, t, s*8/1000000
             printf "VERDICT: %s\n", (s*8/1000000 >= 8.1) ? "PASS - can direct play" : "FAIL - cannot direct play"
