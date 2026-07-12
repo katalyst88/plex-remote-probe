@@ -12,7 +12,7 @@ jobs:
   stream:
     runs-on: ubuntu-latest
     steps:
-      - name: Stream a real movie from Plex over the public internet
+      - name: Stream a real movie from Plex over the public internet (HLS)
         env:
           PLEX_URL: ${{ secrets.PLEX_URL }}
           PLEX_TOKEN: ${{ secrets.PLEX_TOKEN }}
@@ -20,36 +20,51 @@ jobs:
         run: |
           set -uo pipefail
           CID="remote-probe-$RANDOM"
-          H1="X-Plex-Token: $PLEX_TOKEN"
-          H2="X-Plex-Client-Identifier: $CID"
-          H3="X-Plex-Product: Plex for Apple TV"
-          H4="X-Plex-Platform: tvOS"
-          H5="X-Plex-Device: Apple TV"
-          H6="X-Plex-Session-Identifier: $CID"
+          A=(-H "X-Plex-Token: $PLEX_TOKEN" -H "X-Plex-Client-Identifier: $CID"
+             -H "X-Plex-Product: Plex Web" -H "X-Plex-Platform: Chrome"
+             -H "X-Plex-Session-Identifier: $CID")
 
-          echo "runner (remote client) IP: $(curl -s --max-time 10 https://api.ipify.org)"
+          echo "remote client IP: $(curl -s --max-time 10 https://api.ipify.org)"
           echo
 
-          # Ask Plex to make a streaming decision, exactly like a TV app does.
-          DEC="$PLEX_URL/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=http&directPlay=1&directStream=1&fastSeek=1&location=wan&session=$CID&X-Plex-Client-Profile-Name=tvOS"
-          curl -s -o /tmp/dec.xml -H "$H1" -H "$H2" -H "$H3" -H "$H4" -H "$H5" -H "$H6" --max-time 45 "$DEC"
-          echo "=== Plex's streaming decision for a WAN client ==="
-          grep -oE 'decisionCode="[^"]*"|generalDecisionText="[^"]*"|directPlayDecisionText="[^"]*"|transcodeDecisionText="[^"]*"' /tmp/dec.xml | head -4 | sed 's/^/  /'
+          B="$PLEX_URL/video/:/transcode/universal"
+          Q="path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=hls&directPlay=0&directStream=1&fastSeek=1&location=wan&maxVideoBitrate=12000&videoQuality=100&videoResolution=1920x1080&session=$CID&X-Plex-Client-Identifier=$CID"
+
+          echo "=== 1. start an HLS transcode session (as a WAN client) ==="
+          code=$(curl -s -o /tmp/master.m3u8 -w '%{http_code}' --max-time 60 "${A[@]}" "$B/start.m3u8?$Q")
+          echo "  start.m3u8 -> HTTP $code"
+          grep -E "BANDWIDTH|RESOLUTION" /tmp/master.m3u8 | head -1 | sed 's/^/  /'
+          SUB=$(grep -v '^#' /tmp/master.m3u8 | head -1 | tr -d '\r')
+          [ -z "$SUB" ] && { echo "  no sub-playlist; aborting"; exit 1; }
+          case "$SUB" in http*) SUBURL="$SUB";; /*) SUBURL="$PLEX_URL$SUB";; *) SUBURL="$B/$SUB";; esac
           echo
 
-          echo "=== STREAMING for 30 seconds (real transcode session over WAN) ==="
-          SURL="$PLEX_URL/video/:/transcode/universal/start?path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=http&directPlay=0&directStream=1&fastSeek=1&location=wan&maxVideoBitrate=12000&videoQuality=100&videoResolution=1920x1080&session=$CID&copyts=1"
-          read code tot spd size <<<"$(curl -s -o /tmp/stream.ts \
-            -w '%{http_code} %{time_total} %{speed_download} %{size_download}' \
-            --max-time 30 -H "$H1" -H "$H2" -H "$H3" -H "$H4" -H "$H5" -H "$H6" "$SURL")"
-          awk -v c="$code" -v t="$tot" -v s="$spd" -v z="$size" 'BEGIN{
-            printf "  HTTP %s   pulled %.1f MB in %.1fs   =  %.2f Mbps sustained\n", c, z/1048576, t, s*8/1000000
+          echo "=== 2. fetch the segment playlist (transcoder warming up) ==="
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /tmp/idx.m3u8 -w '%{http_code}' --max-time 45 "${A[@]}" "$SUBURL")
+            n=$(grep -c '\.ts' /tmp/idx.m3u8 || true)
+            echo "  attempt $i: HTTP $code, $n segments listed"
+            [ "$n" -gt 0 ] && break
+            sleep 5
+          done
+          [ "$n" -eq 0 ] && { echo "  transcoder produced no segments"; exit 1; }
+          echo
+
+          echo "=== 3. DOWNLOAD REAL VIDEO SEGMENTS over the internet ==="
+          total=0; secs=0; start=$(date +%s%N)
+          for seg in $(grep '\.ts' /tmp/idx.m3u8 | head -8 | tr -d '\r'); do
+            case "$seg" in http*) SU="$seg";; /*) SU="$PLEX_URL$seg";; *) SU="$(dirname "$SUBURL")/$seg";; esac
+            sz=$(curl -s -o /tmp/seg.ts -w '%{size_download}' --max-time 60 "${A[@]}" "$SU")
+            hdr=$(head -c 1 /tmp/seg.ts | xxd -p 2>/dev/null)
+            total=$((total+sz)); secs=$((secs+4))
+            echo "  segment: $(awk -v s="$sz" 'BEGIN{printf "%.2f", s/1048576}') MB  (starts 0x$hdr - 47 = valid MPEG-TS)"
+          done
+          end=$(date +%s%N)
+          el=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.2f", (b-a)/1000000000}')
+          echo
+          awk -v t="$total" -v e="$el" -v v="$secs" 'BEGIN{
+            printf "  downloaded %.1f MB of video in %ss  =  %.2f Mbps sustained\n", t/1048576, e, (t*8)/(e*1000000)
+            printf "  that is %.0f seconds of playback fetched in %ss (%.1fx realtime)\n", v, e, v/e
+            printf "  VERDICT: %s\n", (t > 3000000 && v/e > 1.0) ? "PASS - remote streaming works, faster than realtime" : "FAIL"
           }'
-          echo "  first bytes of payload: $(head -c 4 /tmp/stream.ts | xxd -p 2>/dev/null || echo n/a)  (47... = valid MPEG-TS video)"
-          if [ "$size" -gt 2000000 ]; then
-            echo "  VERDICT: PASS - a remote client can stream video from this server"
-          else
-            echo "  VERDICT: FAIL - stream did not deliver video"
-          fi
-
-          curl -s -o /dev/null -H "$H1" -H "$H2" "$PLEX_URL/video/:/transcode/universal/stop?session=$CID" || true
+          curl -s -o /dev/null "${A[@]}" "$B/stop?session=$CID" || true
