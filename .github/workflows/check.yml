@@ -60,8 +60,16 @@ jobs:
           # segments and check the MPEG-TS sync byte, not just the HTTP status.
           mbps=0; realtime=0; segs=0
           Q="path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=hls&directPlay=0&directStream=1&fastSeek=1&location=wan&maxVideoBitrate=12000&videoQuality=100&videoResolution=1920x1080&session=$CID&X-Plex-Client-Identifier=$CID"
-          scode=$(curl -s -o /tmp/master.m3u8 -w '%{http_code}' --max-time 60 "${A[@]}" "$B/start.m3u8?$Q")
-          echo "  start stream: HTTP $scode"
+          # Plex briefly 400s a new transcode while a previous session is still tearing
+          # down, so a single attempt flaps between PASS and FAIL. Retry before believing
+          # it: a real outage fails all three, a teardown clears in seconds.
+          scode=000
+          for i in 1 2 3; do
+            scode=$(curl -s -o /tmp/master.m3u8 -w '%{http_code}' --max-time 60 "${A[@]}" "$B/start.m3u8?$Q")
+            echo "  start stream (attempt $i): HTTP $scode"
+            [ "$scode" = "200" ] && break
+            sleep 8
+          done
           if [ "$scode" != "200" ]; then
             fails="$fails;could not start a stream (HTTP $scode)"
           else
