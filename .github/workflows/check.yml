@@ -40,6 +40,10 @@ jobs:
           # small enough to stay well inside the job timeout even on a bad link.
           WARMUP_S=30
           SEGS_N=20
+          # Parallel connections used to measure capacity. A single connection from this
+          # runner measures the 310ms path to GitHub, not the house -- see the long note
+          # at the download step, and throughput.yml.
+          PAR_N=6
 
           # ---- 1. Can a remote client connect at all? -----------------------
           # This is the one that caught the router's DoS protection: the time was
@@ -122,49 +126,71 @@ jobs:
               want=$(awk -F: -v n="$SEGS_N" '/^#EXTINF/{d+=$2; c++; if(c==n) exit} END{printf "%.2f", d}' /tmp/idx.m3u8)
               awk -v w="$want" 'BEGIN{exit !(w<=0)}' && want=0
 
-              total=0; got=0; start=$(date +%s%N)
+              # Fetch the segments in PARALLEL, and measure CAPACITY -- what the house can
+              # actually push to a remote viewer -- not the speed of one TCP connection.
+              #
+              # This distinction is the whole ballgame. This runner sits in a US datacentre,
+              # ~310ms from Melbourne, and a single TCP stream over a long path is capped at
+              # roughly window/RTT no matter how healthy the link is. Measured 2026-07-14:
+              # the SAME segments pulled one at a time gave 4.81 Mbps, but six at a time gave
+              # 23.05 Mbps. Nothing about the house changed between those two numbers -- only
+              # the number of connections. So a serial figure from here says almost nothing
+              # about whether people can watch; it mostly measures the distance to GitHub.
+              # A viewer in Australia (~20ms) never hits that ceiling.
+              #
+              # Capacity is the honest question: can the house sustain more than the stream's
+              # own bitrate? If yes, video plays. See throughput.yml for the serial-vs-parallel
+              # diagnostic that established this.
+              : > /tmp/urls.txt
               for seg in $(grep '\.ts' /tmp/idx.m3u8 | head -"$SEGS_N" | tr -d '\r'); do
-                case "$seg" in http*) SU="$seg";; /*) SU="$PLEX_URL$seg";; *) SU="$(dirname "$SUBURL")/$seg";; esac
-                sz=$(curl -s -o /tmp/seg.ts -w '%{size_download}' --max-time 60 "${A[@]}" "$SU")
-                hdr=$(head -c 1 /tmp/seg.ts | xxd -p 2>/dev/null)
-                got=$((got+1))
-                # 0x47 is the MPEG-TS sync byte. Anything else is not video.
-                [ "$hdr" = "47" ] && segs=$((segs+1))
-                total=$((total+sz))
-              done
+                case "$seg" in http*) echo "$seg";; /*) echo "$PLEX_URL$seg";; *) echo "$(dirname "$SUBURL")/$seg";; esac
+              done >> /tmp/urls.txt
+
+              rm -rf /tmp/segs && mkdir -p /tmp/segs
+              start=$(date +%s%N)
+              nl -n rz -w4 /tmp/urls.txt | xargs -P "$PAR_N" -n2 sh -c \
+                'curl -s -o "/tmp/segs/$1.ts" --max-time 90 \
+                   -H "X-Plex-Token: '"$PLEX_TOKEN"'" -H "X-Plex-Client-Identifier: '"$CID"'" \
+                   -H "X-Plex-Product: Plex Web" -H "X-Plex-Platform: Chrome" "$2"' sh
               end=$(date +%s%N)
               el=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.2f", (b-a)/1000000000}')
-              mbps=$(awk -v t="$total" -v e="$el" 'BEGIN{printf "%.2f", (t*8)/(e*1000000)}')
-              # want=0 means the playlist carried no EXTINF we could read. Report the raw
-              # throughput and skip the realtime call rather than inventing a ratio.
-              realtime=$(awk -v w="$want" -v e="$el" 'BEGIN{printf "%.2f", (w>0 && e>0) ? w/e : 0}')
-              echo "  pulled $segs/$got video segments, $(awk -v t="$total" 'BEGIN{printf "%.1f", t/1048576}') MB"
-              echo "  ${want}s of playback in ${el}s = ${mbps} Mbps (${realtime}x realtime)"
+
+              total=0; got=0
+              for f in /tmp/segs/*.ts; do
+                [ -e "$f" ] || continue
+                got=$((got+1))
+                total=$((total + $(wc -c < "$f")))
+                # 0x47 is the MPEG-TS sync byte. Anything else is not video.
+                [ "$(head -c 1 "$f" | xxd -p 2>/dev/null)" = "47" ] && segs=$((segs+1))
+              done
+
+              # mbps = what the house CAN push. need = what this stream actually costs.
+              mbps=$(awk -v t="$total" -v e="$el" 'BEGIN{printf "%.2f", (e>0)? (t*8)/(e*1000000) : 0}')
+              need=$(awk -v t="$total" -v w="$want" 'BEGIN{printf "%.2f", (w>0)? (t*8)/(w*1000000) : 0}')
+              # Headroom: capacity divided by what the video costs. >1 means it plays.
+              realtime=$(awk -v c="$mbps" -v n="$need" 'BEGIN{printf "%.2f", (n>0)? c/n : 0}')
+              echo "  pulled $segs/$got video segments, $(awk -v t="$total" 'BEGIN{printf "%.1f", t/1048576}') MB, ${PAR_N} at a time"
+              echo "  the house pushed ${mbps} Mbps; this stream costs ${need} Mbps -> ${realtime}x headroom"
 
               # Black screen: judge the segments we ACTUALLY fetched, not a fixed count.
-              # The old "-lt 3" fired whenever the playlist listed fewer than 3 segments,
-              # which is a transcoder still warming up, not a black screen.
-              if [ "$segs" -eq 0 ]; then
+              if [ "$got" -eq 0 ] || [ "$segs" -eq 0 ]; then
                 fails="$fails;stream delivered no usable video (black screen)"
               elif [ "$segs" -lt "$got" ]; then
                 fails="$fails;stream delivered corrupt video ($segs of $got segments were valid)"
               fi
 
-              # Throughput is a BANDWIDTH signal, not a lockout signal -- and it is the
-              # only one here that is inherently noisy. It gets a wide dead-band so it
-              # cannot flap: only a stream that would genuinely stall for a viewer counts.
-              # Anything from 0.75x up is reported but does not alert. A true outage does
-              # not present as 0.96x; it presents as failed connects or no segments, and
-              # those are hard failures above.
-              # want=0 means we could not read segment durations, so there is no honest
-              # ratio to judge. Say so rather than failing on a number we did not measure.
-              if awk -v w="$want" 'BEGIN{exit !(w<=0)}'; then
-                echo "  NOTE: no EXTINF durations in the playlist - cannot judge speed, only reachability"
+              # Only fail when the house genuinely cannot carry the video it is being asked
+              # to send. The dead-band is deliberately wide: this figure is the noisiest thing
+              # here, and an alert that fires on noise is one JD learns to ignore. A real
+              # outage does not show up as slightly-low headroom -- it shows up as failed
+              # connects or no segments, and those are hard failures above.
+              if awk -v n="$need" 'BEGIN{exit !(n<=0)}'; then
+                echo "  NOTE: could not read segment durations - judging reachability only, not speed"
               else
-                awk -v r="$realtime" 'BEGIN{exit !(r<0.75)}' && \
-                  fails="$fails;video arrives too slowly to play (${realtime}x realtime) - it would stall"
-                awk -v r="$realtime" 'BEGIN{exit !(r>=0.75 && r<1.0)}' && \
-                  echo "  NOTE: ${realtime}x realtime is tight but playable - not alerting"
+                awk -v r="$realtime" 'BEGIN{exit !(r<1.0)}' && \
+                  fails="$fails;the house cannot push this stream fast enough (${mbps} Mbps available, ${need} Mbps needed) - it would stall"
+                awk -v r="$realtime" 'BEGIN{exit !(r>=1.0 && r<1.5)}' && \
+                  echo "  NOTE: only ${realtime}x headroom - playable, but thin. Not alerting."
               fi
             fi
           fi
