@@ -34,6 +34,13 @@ jobs:
           B="$PLEX_URL/video/:/transcode/universal"
           fails=""
 
+          # Seconds to let Plex's transcoder run before we time the download, and how many
+          # segments to time. Plex uses ~1s HLS segments, so 20 of them is 20s of playback
+          # and a few MB -- a big enough sample that one slow TCP ramp cannot skew it, and
+          # small enough to stay well inside the job timeout even on a bad link.
+          WARMUP_S=30
+          SEGS_N=20
+
           # ---- 1. Can a remote client connect at all? -----------------------
           # This is the one that caught the router's DoS protection: the time was
           # all in time_connect, before Plex ever saw the request.
@@ -96,29 +103,27 @@ jobs:
             if [ "$n" -eq 0 ]; then
               fails="$fails;stream started but produced no video (black screen)"
             else
-              # Let the transcoder get AHEAD before we time anything. Plex serves HLS
-              # live: it will happily list a segment and then hold the HTTP request open
-              # while it finishes encoding it. Time that and you are measuring Plex's
-              # encoder, not the network -- and Plex deliberately throttles its encoder
-              # to about realtime once it is buffered ahead, so the number lands on ~1.0x
-              # no matter how healthy the connection is. Wait for a real backlog first.
-              for i in $(seq 1 6); do
-                awk -v n="$n" 'BEGIN{exit !(n>=6)}' && break
-                sleep 5
-                curl -s -o /tmp/idx.m3u8 --max-time 45 "${A[@]}" "$SUBURL"
-                n=$(grep -c '\.ts' /tmp/idx.m3u8 || true)
-              done
-              echo "  transcoder has $n segments buffered; timing the download of up to 4"
+              # Let the transcoder get AHEAD before timing anything, or we measure Plex's
+              # ENCODER instead of the network. Plex serves HLS live: it will list a
+              # segment and then hold the HTTP request open while it finishes encoding it.
+              #
+              # We cannot detect the backlog from the playlist: Plex lists every segment
+              # of the movie up front (a 2h film shows ~6800 of them), so "how many are
+              # listed" tells us nothing about how many are actually ENCODED. Hence a flat
+              # warm-up. By the time it elapses the opening segments are long since on
+              # disk, so fetching them measures the pipe and nothing else.
+              echo "  playlist lists $n segments; letting the transcoder warm up ${WARMUP_S}s"
+              sleep "$WARMUP_S"
 
               # Real playback seconds come from the playlist's own EXTINF durations, for
               # exactly the segments we fetch. The old code hardcoded "4 segments x 4s =
-              # 16s", which is wrong whenever Plex picks a different segment length or
-              # lists fewer than 4 -- and it fed the realtime figure directly.
-              want=$(awk -F: '/^#EXTINF/{d+=$2; c++; if(c==4) exit} END{printf "%.2f", d}' /tmp/idx.m3u8)
-              awk -v w="$want" 'BEGIN{exit !(w<=0)}' && want=16
+              # 16s" -- but Plex uses ~1s segments here, so it overstated realtime by 4x
+              # and was calling a badly stalling stream "0.96x, basically fine".
+              want=$(awk -F: -v n="$SEGS_N" '/^#EXTINF/{d+=$2; c++; if(c==n) exit} END{printf "%.2f", d}' /tmp/idx.m3u8)
+              awk -v w="$want" 'BEGIN{exit !(w<=0)}' && want=0
 
               total=0; got=0; start=$(date +%s%N)
-              for seg in $(grep '\.ts' /tmp/idx.m3u8 | head -4 | tr -d '\r'); do
+              for seg in $(grep '\.ts' /tmp/idx.m3u8 | head -"$SEGS_N" | tr -d '\r'); do
                 case "$seg" in http*) SU="$seg";; /*) SU="$PLEX_URL$seg";; *) SU="$(dirname "$SUBURL")/$seg";; esac
                 sz=$(curl -s -o /tmp/seg.ts -w '%{size_download}' --max-time 60 "${A[@]}" "$SU")
                 hdr=$(head -c 1 /tmp/seg.ts | xxd -p 2>/dev/null)
@@ -130,7 +135,9 @@ jobs:
               end=$(date +%s%N)
               el=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.2f", (b-a)/1000000000}')
               mbps=$(awk -v t="$total" -v e="$el" 'BEGIN{printf "%.2f", (t*8)/(e*1000000)}')
-              realtime=$(awk -v w="$want" -v e="$el" 'BEGIN{printf "%.2f", w/e}')
+              # want=0 means the playlist carried no EXTINF we could read. Report the raw
+              # throughput and skip the realtime call rather than inventing a ratio.
+              realtime=$(awk -v w="$want" -v e="$el" 'BEGIN{printf "%.2f", (w>0 && e>0) ? w/e : 0}')
               echo "  pulled $segs/$got video segments, $(awk -v t="$total" 'BEGIN{printf "%.1f", t/1048576}') MB"
               echo "  ${want}s of playback in ${el}s = ${mbps} Mbps (${realtime}x realtime)"
 
@@ -149,10 +156,16 @@ jobs:
               # Anything from 0.75x up is reported but does not alert. A true outage does
               # not present as 0.96x; it presents as failed connects or no segments, and
               # those are hard failures above.
-              awk -v r="$realtime" 'BEGIN{exit !(r<0.75)}' && \
-                fails="$fails;video arrives too slowly to play (${realtime}x realtime) - it would stall"
-              awk -v r="$realtime" 'BEGIN{exit !(r>=0.75 && r<1.0)}' && \
-                echo "  NOTE: ${realtime}x realtime is tight but playable - not alerting"
+              # want=0 means we could not read segment durations, so there is no honest
+              # ratio to judge. Say so rather than failing on a number we did not measure.
+              if awk -v w="$want" 'BEGIN{exit !(w<=0)}'; then
+                echo "  NOTE: no EXTINF durations in the playlist - cannot judge speed, only reachability"
+              else
+                awk -v r="$realtime" 'BEGIN{exit !(r<0.75)}' && \
+                  fails="$fails;video arrives too slowly to play (${realtime}x realtime) - it would stall"
+                awk -v r="$realtime" 'BEGIN{exit !(r>=0.75 && r<1.0)}' && \
+                  echo "  NOTE: ${realtime}x realtime is tight but playable - not alerting"
+              fi
             fi
           fi
           curl -s -o /dev/null "${A[@]}" "$B/stop?session=$CID" || true
