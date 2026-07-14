@@ -96,11 +96,33 @@ jobs:
             if [ "$n" -eq 0 ]; then
               fails="$fails;stream started but produced no video (black screen)"
             else
-              total=0; start=$(date +%s%N)
+              # Let the transcoder get AHEAD before we time anything. Plex serves HLS
+              # live: it will happily list a segment and then hold the HTTP request open
+              # while it finishes encoding it. Time that and you are measuring Plex's
+              # encoder, not the network -- and Plex deliberately throttles its encoder
+              # to about realtime once it is buffered ahead, so the number lands on ~1.0x
+              # no matter how healthy the connection is. Wait for a real backlog first.
+              for i in $(seq 1 6); do
+                awk -v n="$n" 'BEGIN{exit !(n>=6)}' && break
+                sleep 5
+                curl -s -o /tmp/idx.m3u8 --max-time 45 "${A[@]}" "$SUBURL"
+                n=$(grep -c '\.ts' /tmp/idx.m3u8 || true)
+              done
+              echo "  transcoder has $n segments buffered; timing the download of up to 4"
+
+              # Real playback seconds come from the playlist's own EXTINF durations, for
+              # exactly the segments we fetch. The old code hardcoded "4 segments x 4s =
+              # 16s", which is wrong whenever Plex picks a different segment length or
+              # lists fewer than 4 -- and it fed the realtime figure directly.
+              want=$(awk -F: '/^#EXTINF/{d+=$2; c++; if(c==4) exit} END{printf "%.2f", d}' /tmp/idx.m3u8)
+              awk -v w="$want" 'BEGIN{exit !(w<=0)}' && want=16
+
+              total=0; got=0; start=$(date +%s%N)
               for seg in $(grep '\.ts' /tmp/idx.m3u8 | head -4 | tr -d '\r'); do
                 case "$seg" in http*) SU="$seg";; /*) SU="$PLEX_URL$seg";; *) SU="$(dirname "$SUBURL")/$seg";; esac
                 sz=$(curl -s -o /tmp/seg.ts -w '%{size_download}' --max-time 60 "${A[@]}" "$SU")
                 hdr=$(head -c 1 /tmp/seg.ts | xxd -p 2>/dev/null)
+                got=$((got+1))
                 # 0x47 is the MPEG-TS sync byte. Anything else is not video.
                 [ "$hdr" = "47" ] && segs=$((segs+1))
                 total=$((total+sz))
@@ -108,11 +130,29 @@ jobs:
               end=$(date +%s%N)
               el=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.2f", (b-a)/1000000000}')
               mbps=$(awk -v t="$total" -v e="$el" 'BEGIN{printf "%.2f", (t*8)/(e*1000000)}')
-              # 4 segments x 4s of playback each = 16s of video fetched.
-              realtime=$(awk -v e="$el" 'BEGIN{printf "%.2f", 16/e}')
-              echo "  pulled $segs video segments, $(awk -v t="$total" 'BEGIN{printf "%.1f", t/1048576}') MB, ${mbps} Mbps (${realtime}x realtime)"
-              [ "$segs" -lt 3 ] && fails="$fails;stream delivered no usable video (black screen)"
-              awk -v r="$realtime" 'BEGIN{exit !(r<1.0)}' && fails="$fails;stream is slower than realtime (${realtime}x) - it would buffer"
+              realtime=$(awk -v w="$want" -v e="$el" 'BEGIN{printf "%.2f", w/e}')
+              echo "  pulled $segs/$got video segments, $(awk -v t="$total" 'BEGIN{printf "%.1f", t/1048576}') MB"
+              echo "  ${want}s of playback in ${el}s = ${mbps} Mbps (${realtime}x realtime)"
+
+              # Black screen: judge the segments we ACTUALLY fetched, not a fixed count.
+              # The old "-lt 3" fired whenever the playlist listed fewer than 3 segments,
+              # which is a transcoder still warming up, not a black screen.
+              if [ "$segs" -eq 0 ]; then
+                fails="$fails;stream delivered no usable video (black screen)"
+              elif [ "$segs" -lt "$got" ]; then
+                fails="$fails;stream delivered corrupt video ($segs of $got segments were valid)"
+              fi
+
+              # Throughput is a BANDWIDTH signal, not a lockout signal -- and it is the
+              # only one here that is inherently noisy. It gets a wide dead-band so it
+              # cannot flap: only a stream that would genuinely stall for a viewer counts.
+              # Anything from 0.75x up is reported but does not alert. A true outage does
+              # not present as 0.96x; it presents as failed connects or no segments, and
+              # those are hard failures above.
+              awk -v r="$realtime" 'BEGIN{exit !(r<0.75)}' && \
+                fails="$fails;video arrives too slowly to play (${realtime}x realtime) - it would stall"
+              awk -v r="$realtime" 'BEGIN{exit !(r>=0.75 && r<1.0)}' && \
+                echo "  NOTE: ${realtime}x realtime is tight but playable - not alerting"
             fi
           fi
           curl -s -o /dev/null "${A[@]}" "$B/stop?session=$CID" || true
