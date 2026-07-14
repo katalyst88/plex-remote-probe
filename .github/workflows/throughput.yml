@@ -1,0 +1,110 @@
+name: plex-remote-throughput
+
+# Diagnostic, not a health check. Answers ONE question that check.yml cannot:
+# when a remote stream looks slow, is the HOUSE's uplink the limit, or is it just
+# the distance between Plex and this runner?
+#
+# A GitHub runner sits in the US; the server is in Melbourne. That is a ~250ms round
+# trip, and a single TCP connection over a long path is capped at roughly
+# (window / RTT) -- so it can read as "slow" on a completely healthy uplink. A real
+# viewer in Australia has a ~20ms RTT and is not subject to the same ceiling.
+#
+# So: pull the same video segments ONE at a time, then N at a time, and compare.
+#   - parallel >> serial  -> the uplink is fine; the serial figure was a distance
+#                            artifact, and check.yml's realtime number understates
+#                            what a nearby viewer gets.
+#   - parallel ~= serial  -> there is a real ceiling (upload cap, shaping, Plex
+#                            per-stream limit). That is a genuine problem.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rating_key:
+        description: "Plex ratingKey to stream"
+        required: false
+        default: "450427"
+
+jobs:
+  throughput:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Serial vs parallel throughput from outside the house
+        env:
+          PLEX_URL: ${{ secrets.PLEX_URL }}
+          PLEX_TOKEN: ${{ secrets.PLEX_TOKEN }}
+          RK: ${{ inputs.rating_key || '450427' }}
+        run: |
+          set -uo pipefail
+          CID="tput-${GITHUB_RUN_ID}-${RANDOM}"
+          A=(-H "X-Plex-Token: $PLEX_TOKEN" -H "X-Plex-Client-Identifier: $CID"
+             -H "X-Plex-Product: Plex Web" -H "X-Plex-Platform: Chrome"
+             -H "X-Plex-Session-Identifier: $CID")
+          B="$PLEX_URL/video/:/transcode/universal"
+          Q="path=%2Flibrary%2Fmetadata%2F$RK&mediaIndex=0&partIndex=0&protocol=hls&directPlay=0&directStream=1&fastSeek=1&location=wan&maxVideoBitrate=12000&videoQuality=100&videoResolution=1920x1080&session=$CID&X-Plex-Client-Identifier=$CID"
+
+          echo "runner IP: $(curl -s --max-time 10 https://api.ipify.org)"
+          rtt=$(curl -s -o /dev/null -w '%{time_connect}' --max-time 25 "${A[@]}" "$PLEX_URL/identity")
+          echo "round trip to Plex: ${rtt}s"
+          echo
+
+          curl -s -o /dev/null --max-time 45 "${A[@]}" "$B/decision?$Q"
+          curl -s -o /tmp/master.m3u8 --max-time 60 "${A[@]}" "$B/start.m3u8?$Q"
+          SUB=$(grep -v '^#' /tmp/master.m3u8 | head -1 | tr -d '\r')
+          case "$SUB" in http*) SUBURL="$SUB";; /*) SUBURL="$PLEX_URL$SUB";; *) SUBURL="$B/$SUB";; esac
+          curl -s -o /tmp/idx.m3u8 --max-time 45 "${A[@]}" "$SUBURL"
+
+          echo "warming the transcoder 40s so we time the network, not the encoder"
+          sleep 40
+
+          # Build absolute URLs for 24 segments. Serial takes the first 12, parallel the
+          # next 12 -- different segments, so Plex cannot serve the parallel half faster
+          # simply because it is already warm in a cache.
+          : > /tmp/urls.txt
+          for seg in $(grep '\.ts' /tmp/idx.m3u8 | head -24 | tr -d '\r'); do
+            case "$seg" in http*) echo "$seg";; /*) echo "$PLEX_URL$seg";; *) echo "$(dirname "$SUBURL")/$seg";; esac
+          done >> /tmp/urls.txt
+
+          head -12 /tmp/urls.txt > /tmp/serial.txt
+          tail -12 /tmp/urls.txt > /tmp/par.txt
+
+          echo
+          echo "=== SERIAL: 12 segments, one connection at a time ==="
+          t0=$(date +%s%N); tot=0
+          while read -r u; do
+            sz=$(curl -s -o /dev/null -w '%{size_download}' --max-time 90 "${A[@]}" "$u")
+            tot=$((tot+sz))
+          done < /tmp/serial.txt
+          t1=$(date +%s%N)
+          ser=$(awk -v a="$t0" -v b="$t1" -v t="$tot" 'BEGIN{e=(b-a)/1e9; printf "%.2f", (t*8)/(e*1e6)}')
+          awk -v a="$t0" -v b="$t1" -v t="$tot" 'BEGIN{printf "  %.1f MB in %.1fs = %.2f Mbps\n", t/1048576, (b-a)/1e9, (t*8)/(((b-a)/1e9)*1e6)}'
+
+          echo
+          echo "=== PARALLEL: 12 segments, 6 connections at once ==="
+          t0=$(date +%s%N)
+          tot=$(xargs -P 6 -I{} curl -s -o /dev/null -w '%{size_download}\n' --max-time 90 \
+                  -H "X-Plex-Token: $PLEX_TOKEN" -H "X-Plex-Client-Identifier: $CID" \
+                  -H "X-Plex-Product: Plex Web" -H "X-Plex-Platform: Chrome" \
+                  "{}" < /tmp/par.txt | awk '{s+=$1} END{print s+0}')
+          t1=$(date +%s%N)
+          par=$(awk -v a="$t0" -v b="$t1" -v t="$tot" 'BEGIN{e=(b-a)/1e9; printf "%.2f", (t*8)/(e*1e6)}')
+          awk -v a="$t0" -v b="$t1" -v t="$tot" 'BEGIN{printf "  %.1f MB in %.1fs = %.2f Mbps\n", t/1048576, (b-a)/1e9, (t*8)/(((b-a)/1e9)*1e6)}'
+
+          curl -s -o /dev/null "${A[@]}" "$B/stop?session=$CID" || true
+
+          echo
+          echo "=== VERDICT ==="
+          awk -v s="$ser" -v p="$par" -v r="$rtt" 'BEGIN{
+            printf "  round trip      : %.0f ms\n", r*1000
+            printf "  serial (1 conn) : %.2f Mbps\n", s
+            printf "  parallel (6)    : %.2f Mbps\n", p
+            printf "  speedup         : %.1fx\n", (s>0)? p/s : 0
+            print  ""
+            if (p > s*2.0)
+              print "  The UPLINK IS FINE. Parallel is far faster than serial, so the serial"
+              print "  figure was limited by TCP over a long path, not by the house. A viewer"
+              print "  closer than this runner will get much more than the serial number."
+            else
+              print "  A REAL CEILING. Parallel buys almost nothing, so something is genuinely"
+              print "  capping upload: ISP shaping, a Plex per-stream limit, or qBit seeding."
+          }'
