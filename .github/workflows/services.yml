@@ -1,0 +1,55 @@
+name: services-external-check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe every forwarded service from the public internet
+        env:
+          HOST: ${{ secrets.WAN_HOST }}
+        run: |
+          set -uo pipefail
+          if [ -z "${HOST:-}" ]; then echo "WAN_HOST secret is not set"; exit 1; fi
+          echo "runner IP $(curl -s --max-time 10 https://api.ipify.org)  ->  home $HOST"
+          echo
+          printf '%-14s %-6s %-6s %-9s %s\n' SERVICE PORT SCHEME CONNECT RESULT
+          fails=0
+          check() {
+            name="$1"; port="$2"; scheme="$3"; path="$4"
+            out=$(curl -sS -o /dev/null -k \
+              -w '%{http_code} %{time_connect}' --max-time 15 \
+              "$scheme://$HOST:$port$path" 2>/dev/null) || out="000 0"
+            code=$(echo "$out" | awk '{print $1}'); ct=$(echo "$out" | awk '{print $2}')
+            if [ "${code:-000}" = "000" ]; then verdict="UNREACHABLE"; fails=$((fails+1))
+            else verdict="reachable (HTTP $code)"; fi
+            printf '%-14s %-6s %-6s %-9s %s\n' "$name" "$port" "$scheme" "${ct}s" "$verdict"
+          }
+          echo "-- plain HTTP services --"
+          check Plex        32400 http  /identity
+          check Sonarr      38082 http  /ping
+          check Radarr      38083 http  /ping
+          check qBittorrent 38081 http  /
+          check Overseerr   5050  http  /api/v1/status
+          check ABS         13378 http  /healthcheck
+          check Archives    2323  http  /
+          check Book        2322  http  /
+          check Stackarr    8484  http  /
+          check Ombii       5000  http  /
+          check Mercer      1289  http  /
+          check AnkerHTTP   80    http  /
+          echo
+          echo "-- HTTPS / Caddy TLS endpoints (-k: ignore cert since we hit raw IP) --"
+          check AnkerTLS    443   https /
+          check SeerrTLS    5443  https /
+          check ABSTLS      13443 https /
+          check SonarrTLS   38443 https /
+          check RadarrTLS   38444 https /
+          check QbitTLS     38445 https /
+          check ArchivesTLS 2443  https /
+          check BookTLS     2444  https /
+          check StackarrTLS 8443  https /
+          echo
+          if [ "$fails" -gt 0 ]; then echo "SUMMARY: $fails service(s) UNREACHABLE from outside"; else echo "SUMMARY: all services reachable from outside"; fi
