@@ -37,8 +37,6 @@ jobs:
           check Archives    2323  http  /
           check Book        2322  http  /
           check Stackarr    8484  http  /
-          check Ombii       5000  http  /
-          check Mercer      1289  http  /
           check AnkerHTTP   80    http  /
           echo
           echo "-- HTTPS / Caddy TLS endpoints (-k: ignore cert since we hit raw IP) --"
